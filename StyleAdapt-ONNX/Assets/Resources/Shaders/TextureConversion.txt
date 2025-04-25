@@ -1,0 +1,73 @@
+#pragma kernel CSTextureToTensor
+#pragma kernel CSTensorToTexture
+
+Texture2D<float4> _InputTexture;
+RWTexture2D<float4> _OutputTexture;
+RWBuffer<float> _OutputBuffer;
+RWBuffer<float> _InputBuffer;
+
+int _Width;
+int _Height;
+int _Channels;
+int _BatchSize;
+float4 _ColorBias;
+
+// 优化版的纹理转张量
+[numthreads(16, 16, 1)]
+void CSTextureToTensor(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint) _Width || id.y >= (uint) _Height)
+        return;
+
+    // 读取纹理像素 - 只读取一次
+    float4 pixel = _InputTexture[id.xy];
+    
+    // 每个批次和通道计算一个偏移量 - 减少重复计算
+    uint pixelIndex = id.y * _Width + id.x;
+    uint heightWidthProduct = _Width * _Height;
+    
+    // 计算索引，考虑批次和通道
+    for (uint b = 0; b < (uint) _BatchSize; b++)
+    {
+        uint batchOffset = b * _Channels * heightWidthProduct;
+        
+        // 优化：预先计算通道偏移量
+        uint redOffset = batchOffset + pixelIndex;
+        uint greenOffset = batchOffset + heightWidthProduct + pixelIndex;
+        uint blueOffset = batchOffset + (2 * heightWidthProduct) + pixelIndex;
+        
+        // 直接写入，避免条件分支
+        _OutputBuffer[redOffset] = pixel.r;
+        _OutputBuffer[greenOffset] = pixel.g;
+        _OutputBuffer[blueOffset] = pixel.b;
+    }
+}
+
+// 优化版的张量转纹理
+[numthreads(16, 16, 1)]
+void CSTensorToTexture(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint) _Width || id.y >= (uint) _Height)
+        return;
+
+    // 计算像素索引 - 减少重复计算
+    uint pixelIndex = id.y * _Width + id.x;
+    uint heightWidthProduct = _Width * _Height;
+    
+    // 预计算通道偏移量
+    uint redOffset = pixelIndex;
+    uint greenOffset = heightWidthProduct + pixelIndex;
+    uint blueOffset = 2 * heightWidthProduct + pixelIndex;
+    
+    // 直接读取RGB值
+    float r = _InputBuffer[redOffset];
+    float g = _InputBuffer[greenOffset];
+    float b = _InputBuffer[blueOffset];
+
+    // 添加颜色偏置并饱和处理 - 使用向量操作优化
+    float3 color = float3(r, g, b) + _ColorBias.rgb;
+    color = saturate(color); // 确保所有通道在[0,1]范围内
+    
+    // 写入输出纹理
+    _OutputTexture[id.xy] = float4(color, 1.0);
+}

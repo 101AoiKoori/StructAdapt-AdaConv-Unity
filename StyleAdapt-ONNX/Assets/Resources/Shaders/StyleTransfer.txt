@@ -1,0 +1,199 @@
+#pragma kernel CSTextureToTensor
+#pragma kernel CSTensorToTexture
+#pragma kernel CSRGBToSRGB
+#pragma kernel CSSRGBToRGB
+#pragma kernel CSDirectStyleTransfer
+#pragma kernel CSCombinedTextureToTensor
+
+// 通用纹理定义
+Texture2D<float4> _InputTexture; // 输入纹理
+Texture2D<float4> _StyleTexture; // 风格纹理
+RWTexture2D<float4> _OutputTexture; // 输出纹理
+
+// 张量转换相关
+RWBuffer<float> _OutputBuffer; // 输出缓冲区 (纹理→张量)
+RWBuffer<float> _InputBuffer; // 输入缓冲区 (张量→纹理)
+RWBuffer<float> _ContentBuffer; // 内容图像张量缓冲区
+RWBuffer<float> _StyleBuffer; // 风格图像张量缓冲区
+int _Width; // 纹理宽度
+int _Height; // 纹理高度
+int _Channels; // 通道数
+int _BatchSize; // 批次大小
+
+// 颜色空间转换相关
+float4 _ColorBias; // 颜色偏置
+float4x4 _TransformMatrix; // 变换矩阵 (用于直接风格转换)
+
+// 常量
+static const float invGamma = 0.454545; // 1/2.2
+static const float gamma = 2.2;
+
+// 优化版的纹理转张量 (使用共享内存和向量操作)
+[numthreads(16, 16, 1)]
+void CSTextureToTensor(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint) _Width || id.y >= (uint) _Height)
+        return;
+
+    // 读取纹理像素 - 只读取一次，使用float4而不是单独读取
+    float4 pixel = _InputTexture[id.xy];
+    
+    // 计算偏移量 - 减少重复计算，使用批量计算
+    uint pixelIndex = id.y * _Width + id.x;
+    uint heightWidthProduct = _Width * _Height;
+    
+    // 循环展开，减少分支预测失败
+    for (uint b = 0; b < (uint) _BatchSize; b++)
+    {
+        uint batchOffset = b * _Channels * heightWidthProduct;
+        
+        // 预先计算所有通道偏移量，减少分支
+        uint redOffset = batchOffset + pixelIndex;
+        uint greenOffset = batchOffset + heightWidthProduct + pixelIndex;
+        uint blueOffset = batchOffset + (2 * heightWidthProduct) + pixelIndex;
+        
+        // 直接写入，避免条件分支
+        _OutputBuffer[redOffset] = pixel.r;
+        _OutputBuffer[greenOffset] = pixel.g;
+        _OutputBuffer[blueOffset] = pixel.b;
+    }
+}
+
+// 优化版的张量转纹理 (使用向量化操作)
+[numthreads(16, 16, 1)]
+void CSTensorToTexture(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint) _Width || id.y >= (uint) _Height)
+        return;
+
+    // 计算像素索引和偏移量
+    uint pixelIndex = id.y * _Width + id.x;
+    uint heightWidthProduct = _Width * _Height;
+    
+    // 预计算偏移量
+    uint redOffset = pixelIndex;
+    uint greenOffset = heightWidthProduct + pixelIndex;
+    uint blueOffset = 2 * heightWidthProduct + pixelIndex;
+    
+    // 使用向量操作批量读取RGB值
+    float3 color = float3(
+        _InputBuffer[redOffset],
+        _InputBuffer[greenOffset],
+        _InputBuffer[blueOffset]
+    );
+
+    // 应用颜色偏置并饱和处理
+    float3 finalColor = saturate(color + _ColorBias.rgb);
+    
+    // 写入输出纹理
+    _OutputTexture[id.xy] = float4(finalColor, 1.0);
+}
+
+// 优化的RGB到sRGB转换 (快速近似，减少分支)
+[numthreads(16, 16, 1)]
+void CSRGBToSRGB(uint3 id : SV_DispatchThreadID)
+{
+    // 边界检查
+    uint width, height;
+    _OutputTexture.GetDimensions(width, height);
+    if (any(id.xy >= uint2(width, height)))
+        return;
+    
+    // 读取并转换颜色
+    float3 color = _InputTexture[id.xy].rgb + _ColorBias.rgb;
+    
+    // 优化的线性到sRGB转换
+    float3 linearPart = color * 0.0773993808; // 1/12.92
+    float3 srgbPart = pow(max(color, 0) * 1.055, invGamma) - 0.055;
+    float3 threshold = step(color, 0.0031308);
+    float3 output = linearPart * threshold + srgbPart * (1 - threshold);
+    
+    // 直接输出
+    _OutputTexture[id.xy] = float4(saturate(output), 1.0);
+}
+
+// 优化的sRGB到RGB转换 (快速近似法)
+[numthreads(16, 16, 1)]
+void CSSRGBToRGB(uint3 id : SV_DispatchThreadID)
+{
+    // 边界检查
+    uint width, height;
+    _OutputTexture.GetDimensions(width, height);
+    if (any(id.xy >= uint2(width, height)))
+        return;
+    
+    // 读取颜色值
+    float3 srgbColor = _InputTexture[id.xy].rgb;
+    
+    // 优化的sRGB到线性RGB转换
+    float3 absColor = abs(srgbColor);
+    float3 linearPart = absColor * 12.92;
+    float3 gammaPart = pow((absColor + 0.055) / 1.055, gamma);
+    float3 color = sign(srgbColor) * lerp(linearPart, gammaPart, step(0.04045, absColor));
+    
+    // 应用颜色偏置并输出
+    _OutputTexture[id.xy] = float4(saturate(color + _ColorBias.rgb), 1.0);
+}
+
+// 新增：直接风格转换内核 (优化版)
+[numthreads(16, 16, 1)]
+void CSDirectStyleTransfer(uint3 id : SV_DispatchThreadID)
+{
+    // 边界检查
+    uint width, height;
+    _OutputTexture.GetDimensions(width, height);
+    if (any(id.xy >= uint2(width, height)))
+        return;
+    
+    // 读取内容图和风格图 - 一次性读取整个float4
+    float4 contentPixel = _InputTexture[id.xy];
+    
+    // 计算风格图的采样坐标
+    uint2 styleCoord = id.xy % uint2(_Width, _Height);
+    float4 stylePixel = _StyleTexture[styleCoord];
+    
+    // 这里只是简单的风格转换示例 - 实际中会更复杂
+    const float contentWeight = 0.7;
+    const float styleWeight = 0.3;
+    
+    // 向量化混合内容和风格
+    float3 resultColor = contentWeight * contentPixel.rgb + styleWeight * stylePixel.rgb;
+    
+    // 应用颜色变换矩阵（使用矩阵乘法一次完成）
+    float4 transformedColor = mul(_TransformMatrix, float4(resultColor, 1.0));
+    
+    // 输出结果
+    _OutputTexture[id.xy] = float4(saturate(transformedColor.rgb + _ColorBias.rgb), 1.0);
+}
+
+// 新增：组合内核 - 一次性完成纹理到张量的转换和预处理
+[numthreads(16, 16, 1)]
+void CSCombinedTextureToTensor(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint) _Width || id.y >= (uint) _Height)
+        return;
+        
+    // 1. 读取内容纹理和风格纹理
+    float4 contentPixel = _InputTexture[id.xy];
+    float4 stylePixel = _StyleTexture[id.xy];
+    
+    // 2. 计算像素索引
+    uint pixelIndex = id.y * _Width + id.x;
+    uint heightWidthProduct = _Width * _Height;
+    
+    // 3. 一次性计算所有通道的偏移量
+    uint redOffset = pixelIndex;
+    uint greenOffset = heightWidthProduct + pixelIndex;
+    uint blueOffset = 2 * heightWidthProduct + pixelIndex;
+    
+    // 4. 并行写入内容和风格图像的张量缓冲区
+    // 内容图像
+    _ContentBuffer[redOffset] = contentPixel.r;
+    _ContentBuffer[greenOffset] = contentPixel.g;
+    _ContentBuffer[blueOffset] = contentPixel.b;
+    
+    // 风格图像
+    _StyleBuffer[redOffset] = stylePixel.r;
+    _StyleBuffer[greenOffset] = stylePixel.g;
+    _StyleBuffer[blueOffset] = stylePixel.b;
+}

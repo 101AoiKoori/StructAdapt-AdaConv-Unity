@@ -16,5 +16,5 @@ This repository therefore serves as a practical blueprint for deploying structur
 
 > 📄 For detailed methodology and experimental results, please refer to the [published paper](https://doi.org/10.2991/978-94-6463-823-3_100).
 
-![adaconv_static_core](./image/adaconv_static_core.svg)
+![adaconv_static_core](./image/image1.png)
 ---

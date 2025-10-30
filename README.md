@@ -23,24 +23,6 @@ For detailed methodology and experiments, please refer to the [published paper](
 
 ---
 
-## Project Structure
-
-```
-StructAdapt/
-├── StyleAdapt-Core/
-│   ├── configs/
-│   │   ├── lambda100.yaml          # CNN and style-transfer hyperparameter configuration
-│   │   └── requirements.txt        # Python dependencies
-│   ├── train.py                    # Training and fine-tuning entry
-│   ├── exporter.py                 # ONNX exporter (static / dynamic / batch-dynamic modes)
-│   ├── visualizer.py               # Tensorboard / visual output
-│   └── utils/                      # Supporting modules
-├── UnityProject/                   # Unity integration for ONNX runtime or Barracuda
-└── image/                          # Documentation figures
-```
-
----
-
 ## Environment Setup
 
 ### Python Environment
